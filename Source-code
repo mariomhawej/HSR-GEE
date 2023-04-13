@@ -1,0 +1,486 @@
+var geometry = 
+    /* color: #d63000 */
+    /* shown: false */
+    ee.Geometry.Polygon(
+        [[[-121.63428873522334, 40.9266151669724],
+          [-121.63428873522334, 40.91487639908032],
+          [-121.61489099962763, 40.91487639908032],
+          [-121.61489099962763, 40.9266151669724]]], null, false);
+          
+Map.centerObject(geometry,15);
+Map.addLayer(geometry, {color: 'blue'}, 'Flux tower region');
+
+
+for (var year = 2018; year < 2019 ; year++) {
+  for (var m = 8; m < 9; m++) {
+    
+/* Convert to temporal frame */
+var start = new Date(year + "-" + m + "-01");
+var end = new Date(year + "-" + m + "-28");
+var year2 = year-3;
+
+var system =  year + ""+ "0" + m;
+    
+/* Landsat image assessment*/
+    // Load Landsat 8 SR data
+    var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+           .filterDate(start, end)
+           .map(maskL8sr)
+           .map(function(image) {
+              return image
+            .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST_B10'])
+            .rename(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'ST']);
+    });
+    // Get information about the projection.
+    var L8Projection = landsat8.first().projection();
+    
+    // Cloud masking
+    function maskL8sr(image) {
+      // Bits 3 and 4 are cloud shadow and cloud, respectively.
+      var cloudShadowBitMask = (1 << 3);
+      var cloudsBitMask = (1 << 4);
+      // Get the pixel QA band.
+      var qa = image.select('QA_PIXEL');
+      // Both flags should be set to zero, indicating clear conditions.
+      var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                     .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+      return image.updateMask(mask);
+    }
+    
+    // Calculate median and applies scaling factors
+    function applyScaleFactors(image) {
+      var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+      var thermalBands = image.select('ST').multiply(0.00341802).add(149.0);
+      return image.addBands(opticalBands, null, true)
+                  .addBands(thermalBands, null, true);
+    }
+    
+    var l8m = landsat8.map(applyScaleFactors);
+                        //.reproject(median.select('SR_B2').projection(), null, 30);
+    
+    var median = l8m.median();
+    
+    // Map results
+    var visualization = {
+      bands: ['SR_B4', 'SR_B3', 'SR_B2'],
+      min: 0.0,
+      max: 0.3,
+    };
+    
+
+    //Map.addLayer(median, visualization, 'Landsat-8 RGB'+ ' Date: '+ year + m, false);
+    
+    // LST median
+    // Conversion between Kelvin and Celsius
+    var conv = 273.15;
+    
+    var LSTm = median.select('ST').subtract(conv)
+              .reproject(median.select('SR_B2').projection(), null, 30);
+
+    var visParams = {min: -10, max: 40, palette: [
+        '040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
+        '0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
+        '3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 'd6e21f',
+        'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
+        'ff0000', 'de0101', 'c21301', 'a71001', '911003'
+      ],};
+            
+    
+    // Map result
+    Map.addLayer(LSTm.clip(geometry),visParams,'Landsat-8 LST '+ system);
+    
+    // Export a cloud-optimized GeoTIFF.
+    Export.image.toDrive({
+      image: LSTm,
+      description: 'L8_LST_' + system,
+      scale: 30,
+      region: geometry,
+      fileFormat: 'GeoTIFF',
+      maxPixels: 1e10,
+      formatOptions: {
+        cloudOptimized: true
+      }
+    });
+
+/* NAIP image assessment*/
+ 
+// Map the function over one year of data and take the median.
+// Load NAIP TOA reflectance data.
+var collection = ee.ImageCollection('USDA/NAIP/DOQQ')
+    .filter(ee.Filter.date(year2 + '-01-01', year + '-12-31'))
+    .filterBounds(geometry);
+
+// Calculate median
+var naipm = collection.median();
+
+// Define the visualization parameters.
+var trueColor = naipm.select(['R', 'G', 'B']);
+var trueColorVis = {
+  min: 0.0,
+  max: 255.0,
+};
+
+// Map results
+Map.addLayer(trueColor.clip(geometry),trueColorVis,'True Color '+ system);
+
+/* Bandpass adjustment */
+  // Create a new images that is the concatenation of two bands from two sensors
+var red = ee.Image.cat(naipm.select('R'),median.select('SR_B4'));
+var green = ee.Image.cat(naipm.select('G'),median.select('SR_B3'));
+var blue = ee.Image.cat(naipm.select('B'),median.select('SR_B2'));
+var nir = ee.Image.cat(naipm.select('N'),median.select('SR_B5'));
+
+// Calculate regression coefficients for the set of pixels
+var linearFitr = red.reduceRegion({
+  reducer: ee.Reducer.linearFit(),
+  geometry: geometry,
+  scale: 30,
+  tileScale: 16,
+});
+
+// Extract the y-intercept and slope.
+var b0r = linearFitr.get('offset'); // y-intercept
+var b1r = linearFitr.get('scale'); // slope
+
+var new_nr = naipm.select('R').multiply(ee.Number(b1r)).add(ee.Number(b0r))
+          .reproject(median.select('SR_B2').projection(), null, 1);
+
+//Map.addLayer(new_nr,{max: 5000, min: 0}, 'Sentinel-2 RGB');
+
+// Calculate regression coefficients for the set of pixels
+var linearFitg = green.reduceRegion({
+  reducer: ee.Reducer.linearFit(),
+  geometry: geometry,
+  scale: 30,
+  tileScale: 16,
+});
+
+// Extract the y-intercept and slope.
+var b0g = linearFitg.get('offset'); // y-intercept
+var b1g = linearFitg.get('scale'); // slope
+
+var new_ng = naipm.select('G').multiply(ee.Number(b1g)).add(ee.Number(b0g))
+          .reproject(median.select('SR_B2').projection(), null, 1);
+
+// Calculate regression coefficients for the set of pixels
+var linearFitb = blue.reduceRegion({
+  reducer: ee.Reducer.linearFit(),
+  geometry: geometry,
+  scale: 30,
+  tileScale: 16,
+});
+
+// Extract the y-intercept and slope.
+var b0b = linearFitb.get('offset'); // y-intercept
+var b1b = linearFitb.get('scale'); // slope
+
+var new_nb = naipm.select('B').multiply(ee.Number(b1b)).add(ee.Number(b0b))
+          .reproject(median.select('SR_B2').projection(), null, 1);
+
+// Calculate regression coefficients for the set of pixels
+var linearFitn = nir.reduceRegion({
+  reducer: ee.Reducer.linearFit(),
+  geometry: geometry,
+  scale: 30,
+  tileScale: 16,
+});
+
+// Extract the y-intercept and slope.
+var b0n = linearFitn.get('offset'); // y-intercept
+var b1n = linearFitn.get('scale'); // slope
+
+var new_nn = naipm.select('N').multiply(ee.Number(b1n)).add(ee.Number(b0n))
+          .reproject(median.select('SR_B2').projection(), null, 1);
+
+/* RLS between L8 RGB and LST values */
+  // Aggregation of LST
+  var agg_LST = LSTm
+    .reproject(median.select('SR_B2').projection(), null, 900);
+
+// Create a new image that is the concatenation of these bands
+var imgRegress = ee.Image.cat(ee.Image(1), median.select('SR_B4'), median.select('SR_B3'),
+                    median.select('SR_B2'), median.select('SR_B5'), agg_LST, LSTm);
+
+// Calculate regression coefficients
+var linearRegression = imgRegress.reduceRegion({
+  reducer: ee.Reducer.robustLinearRegression({
+    numX: 6,
+    numY: 1
+  }),
+  geometry: geometry,
+  scale: 30,
+});
+
+// Convert the coefficients array to a list.
+var coefList = ee.Array(linearRegression.get('coefficients')).toList();
+
+// Extract the y-intercept and slope.
+var b1 = ee.List(coefList.get(0)).get(0); // y-intercept
+var b2 = ee.List(coefList.get(1)).get(0); // slope-red
+var b3 = ee.List(coefList.get(2)).get(0); // slope-green
+var b4 = ee.List(coefList.get(3)).get(0); // slope-blue
+var b5 = ee.List(coefList.get(4)).get(0); // slope-nir
+var b6 = ee.List(coefList.get(5)).get(0); // slope-aggLST
+
+// Extract the residuals.
+var residuals = ee.Array(linearRegression.get('residuals')).toList().get(0);
+
+// Calculate RLS-LST
+  var HSR_RLS = new_nr.multiply(ee.Number(b4)).add(new_ng.multiply(ee.Number(b3)))
+              .add(new_nb.multiply(ee.Number(b2))).add(new_nb.multiply(ee.Number(b5)))
+              .add(LSTm.multiply(ee.Number(b6)))
+              .add(ee.Number(b1))
+              .reproject(median.select('SR_B2').projection(), null, 1);
+              
+Map.addLayer(HSR_RLS.clip(geometry), visParams, 'HSR_RLS LST '+ system);
+
+// Export the image, specifying scale and region.
+Export.image.toDrive({
+  image: HSR_RLS,
+  description: 'HSR_RLS_LST_' + system,
+  scale: 1,
+  maxPixels: 1e9,
+  region: geometry
+});
+
+/* RF between L8 bands and LST values */
+    
+    var LST10 = LSTm.multiply(10);
+    
+    // Sample the input imagery
+    var trainingrf = ee.Image.cat(median.select('SR_B4'), median.select('SR_B3'),
+                    median.select('SR_B2'), median.select('SR_B5'), agg_LST.multiply(10), 
+                    LST10.int()).stratifiedSample({
+      numPoints: 5,
+      classBand: 'ST_1',
+      region: geometry,
+      scale: 900,
+      seed: 0
+    });
+    
+    // Make a Random Forest classifier and train it.
+    var classifierrf = ee.Classifier.smileRandomForest(130)
+    .train({
+      features: trainingrf,
+      classProperty: 'ST_1',
+      //inputProperties: ['0_NDVI', '0_NDVI_1', '1_NDVI', '2_NDVI', '3_NDVI', '4_NDVI', '5_NDVI', '6_NDVI', '8_NDVI']
+    });
+    
+    // Merge NAIP images from Study area
+    var imgRegress_naip = ee.Image.cat(new_nr, new_ng, new_nb, new_nn,
+                        LST10)
+                      .rename('SR_B4', 'SR_B3', 'SR_B2', 'SR_B5', 'ST');
+                  
+    // Classify the input imagery and compute matrix //
+    var HSR_RF = imgRegress_naip.classify(classifierrf).divide(10);
+   
+Map.addLayer(HSR_RF.clip(geometry), visParams, 'HSR_RF LST '+ system);
+    
+      // Export the image, specifying scale and region.
+    Export.image.toDrive({
+      image: HSR_RF,
+      description: 'HSR_RF_LST_' + system,
+      scale: 1,
+      maxPixels: 1e10,
+      region: geometry
+    });
+    
+/* SVM between L8 bands and LST values */
+    // Make a SVM classifier and train it.
+    var classifiersvm = ee.Classifier.libsvm()
+    .train({
+      features: trainingrf,
+      classProperty: 'ST_1',
+      //inputProperties: ['0_NDVI', '0_NDVI_1', '1_NDVI', '2_NDVI', '3_NDVI', '4_NDVI', '5_NDVI', '6_NDVI', '8_NDVI']
+    });
+
+    // Classify the input imagery and compute matrix //
+    var HSR_SVM = imgRegress_naip.classify(classifiersvm).divide(10);
+
+Map.addLayer(HSR_SVM.clip(geometry), visParams, 'HSR_SVM LST '+ system);
+    
+      // Export the image, specifying scale and region.
+    Export.image.toDrive({
+      image: HSR_SVM,
+      description: 'HSR_SVM_LST_' + system,
+      scale: 1,
+      maxPixels: 1e10,
+      region: geometry
+    });
+
+/* OLS between L8 NDVI and LST values (DisTrad) */
+    // NDVI calculation
+    var medianndvi_1 = median.normalizedDifference(['SR_B5','SR_B4']);
+    var maskndvil8 = medianndvi_1.lt(1).and(medianndvi_1.gt(-1));
+    var medianndvi = medianndvi_1.updateMask(maskndvil8);
+
+    var NAIPn = ee.Image.cat(new_nr,new_ng,new_nb,new_nn);
+    var medianndvis2_1 = NAIPn.normalizedDifference(['N','R']);
+    var maskndvis2 = medianndvis2_1.lt(1).and(medianndvis2_1.gt(-1));
+    var medianndviNAIP = medianndvis2_1.updateMask(maskndvis2);
+    
+    //Map.addLayer(medianndvi, {min: 0, max: 1}, 'L8 NDVI');
+    //Map.addLayer(medianndviNAIP, {min: 0, max: 1}, 'NAIP NDVI');
+    
+    // Create a new image that is the concatenation of these bands
+    var imgRegressdis = ee.Image.cat(ee.Image(1), medianndvi, medianndvi.pow(2), LSTm);
+    
+    // Calculate OLS regression coefficients
+    var linearRegressiondis = imgRegressdis.reduceRegion({
+      reducer: ee.Reducer.linearRegression({
+        numX: 3,
+        numY: 1
+      }),
+      geometry: geometry,
+      scale: 30,
+      tileScale: 16,
+      maxPixels: 1e10
+    });
+    
+    // Convert the coefficients array to a list.
+    var coefListdis = ee.Array(linearRegressiondis.get('coefficients')).toList();
+    
+    // Extract the y-intercept and slope.
+    var b1dis = ee.List(coefListdis.get(1)).get(0); // slope-NDVI
+    var b2dis = ee.List(coefListdis.get(2)).get(0); // slope-NDVI2
+    var b0dis = ee.List(coefListdis.get(0)).get(0); // y-intercept
+    
+    // Extract the residuals.
+    var residualsdis = ee.Array(linearRegressiondis.get('residuals')).toList().get(0);
+    
+      /* Calculate residual layer */
+      var resi_dis = medianndvi.multiply(ee.Number(b1dis)).add((medianndvi.pow(2)).multiply(ee.Number(b2dis)))
+                  .add(ee.Number(b0dis))
+                  .subtract(LSTm)
+                  //.reproject(S2proj, null, 30);
+    
+      /* Calculate S2-LST DisTrad*/
+      var NAIP_lstdis = medianndviNAIP.multiply(ee.Number(b1dis)).add((medianndviNAIP.pow(2)).multiply(ee.Number(b2dis)))
+                  .add(ee.Number(b0dis))
+                  .add(resi_dis)
+                  .reproject(median.select('SR_B2').projection(), null, 1);
+
+    Map.addLayer(NAIP_lstdis.clip(geometry), visParams, 'HSR_DisTrad LST'+ system);
+    
+      // Export the image, specifying scale and region.
+    Export.image.toDrive({
+      image: NAIP_lstdis,
+      description: 'HSR_DisTrad_LST_' + system,
+      scale: 1,
+      maxPixels: 1e10,
+      region: geometry
+    });
+
+/* OLS between L8 FVC and LST values (TsHARP) */
+    // FVC calculation
+    var FVC_1 = medianndvi.subtract(0.18).divide(0.67);
+    var FVCl8 = FVC_1.multiply(FVC_1);
+
+    var FVC_1 = medianndviNAIP.subtract(0.18).divide(0.67);
+    var FVCnaip = FVC_1.multiply(FVC_1);
+    
+    //Map.addLayer(medianndvi, {min: 0, max: 1}, 'L8 NDVI');
+    //Map.addLayer(medianndviNAIP, {min: 0, max: 1}, 'NAIP NDVI');
+    
+    // Create a new image that is the concatenation of these bands
+    var imgRegressdis2 = ee.Image.cat(ee.Image(1), FVCl8, LSTm);
+    
+    // Calculate OLS regression coefficients
+    var linearRegressiondis2 = imgRegressdis2.reduceRegion({
+      reducer: ee.Reducer.linearRegression({
+        numX: 2,
+        numY: 1
+      }),
+      geometry: geometry,
+      scale: 30,
+      tileScale: 16,
+      maxPixels: 1e10
+    });
+    
+    // Convert the coefficients array to a list.
+    var coefListdis2 = ee.Array(linearRegressiondis2.get('coefficients')).toList();
+    
+    // Extract the y-intercept and slope.
+    var b1dis2 = ee.List(coefListdis2.get(1)).get(0); // slope-NDVI
+    var b0dis2 = ee.List(coefListdis2.get(0)).get(0); // y-intercept
+    
+    // Extract the residuals.
+    var residualsdis2 = ee.Array(linearRegressiondis2.get('residuals')).toList().get(0);
+    
+      /* Calculate residual layer */
+      var resi_dis2 = FVCl8.multiply(ee.Number(b1dis2))
+                  .add(ee.Number(b0dis2))
+                  .subtract(LSTm)
+                  //.reproject(S2proj, null, 30);
+    
+      /* Calculate S2-LST DisTrad*/
+      var NAIP_lsttS = FVCnaip.multiply(ee.Number(b1dis2))
+                  .add(ee.Number(b0dis2))
+                  .add(resi_dis2)
+                  .reproject(median.select('SR_B2').projection(), null, 1);
+
+    Map.addLayer(NAIP_lsttS.clip(geometry), visParams, 'HSR_TsHarp LST'+ system);
+    
+      // Export the image, specifying scale and region.
+    Export.image.toDrive({
+      image: NAIP_lsttS,
+      description: 'HSR_TsHarp_LST_' + system,
+      scale: 1,
+      maxPixels: 1e10,
+      region: geometry
+    });
+  }}
+  
+/** Legend setup */
+
+      // Creates a color bar thumbnail image for use in legend from the given color
+      // palette.
+      function makeColorBarParams(palette) {
+        return {
+          bbox: [0, 0, 1, 0.1],
+          dimensions: '10x100',
+          format: 'png',
+          min: 0,
+          max: 1,
+          palette: palette,
+        };
+      }
+      
+      var vis = {min: -10, max: 40, palette: [
+          '040274', '040281', '0502a3', '0502b8', '0502ce', '0502e6',
+          '0602ff', '235cb1', '307ef3', '269db1', '30c8e2', '32d3ef',
+          '3be285', '3ff38f', '86e26f', '3ae237', 'b5e22e', 'd6e21f',
+          'fff705', 'ffd611', 'ffb613', 'ff8b13', 'ff6e08', 'ff500d',
+          'ff0000', 'de0101', 'c21301', 'a71001', '911003'
+        ],};
+        
+      // Create the color bar for the legend.
+      var colorBar = ui.Thumbnail({
+        image: ee.Image.pixelLonLat().select(0),
+        params: makeColorBarParams(vis.palette),
+        style: {stretch: 'horizontal', margin: '10px 8px', maxHeight: '5px'},
+      });
+      
+      // Create a panel with three numbers for the legend.
+      var legendLabels = ui.Panel({
+        widgets: [
+          ui.Label(vis.min, {margin: '4px 8px', fontSize: '11px', fontFamily: 'serif', color: 'blue', fontWeight: 'bold'}),
+          ui.Label(
+              ((vis.max-vis.min) / 2+vis.min),
+              {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal', fontSize: '11px', fontFamily: 'serif', color: 'green', fontWeight: 'bold'}),
+          ui.Label(vis.max, {margin: '4px 8px', fontSize: '11px', fontFamily: 'serif', color: 'red', fontWeight: 'bold'})
+        ],
+        layout: ui.Panel.Layout.flow('horizontal'),
+      });
+      
+      var legendTitle = ui.Label({
+        value: 'Land Surface Temperature (C)',
+        style: {fontWeight: 'bold', fontFamily: 'serif'}
+      });
+      
+      // Add the legendPanel to the map.
+      var legendPanel = ui.Panel({widgets: [legendTitle, colorBar, legendLabels],
+      style: {position: 'bottom-right'} 
+      });
+      Map.add(legendPanel);
+      
